@@ -21,10 +21,10 @@
 local Players = game:GetService("Players")
 local LocalPlayer = Players.LocalPlayer
 
-assert(LocalPlayer, "[F3X] Нужно запускать в игре: LocalPlayer не найден.")
+assert(LocalPlayer, "[F3X] Run this in-game: LocalPlayer not found.")
 
 local Backpack = LocalPlayer:FindFirstChildOfClass("Backpack") or LocalPlayer:WaitForChild("Backpack", 10)
-assert(Backpack, "[F3X] Не удалось получить Backpack игрока.")
+assert(Backpack, "[F3X] Could not get the player Backpack.")
 
 -- Легаси-глобалы, которые местами встречаются в старом коде F3X-семейства.
 if rawget(_G, "Game") == nil then
@@ -314,7 +314,7 @@ local Loaded, SyncModule = pcall(function ()
 end)
 
 if not Loaded then
-	warn("[F3X] LocalEndpoint: SyncModule не загрузился: " .. tostring(SyncModule))
+	warn("[F3X] LocalEndpoint: SyncModule failed to load: " .. tostring(SyncModule))
 end
 
 SyncAPI.OnInvoke = function (...)
@@ -5176,9 +5176,16 @@ if SyncModule.ToolMode == 'Tool' then
 end;
 
 
--- [F3X-LOCAL] Поддержка CSG (Union / Separate / Negate).
--- У большинства экзекьюторов GeometryService:UnionAsync недоступен,
--- поэтому проверяем возможности заранее и, если их нет, отключаем только Union-действия.
+-- [F3X-LOCAL] Union support detection.
+--
+-- The reliable question is not "can I call GeometryService:UnionAsync" (it errors for
+-- unrelated reasons and lies), but "can this executor read union geometry at all".
+-- Same approach as UniversalSynSaveInstance:
+--   1. find a real UnionOperation in the game (recursive, pcall-safe);
+--   2. if the map has none, look in nil instances (getnilinstances);
+--   3. read its AssetId through gethiddenproperty / get_hidden_property / get_hiddenprop;
+--   4. if the value is not nil/"null"/"" and is longer than 5 chars, CSG is real;
+--   5. only if there is nothing to read at all, fall back to a test union.
 local UnionSupported = rawget(_G, "Fork3XLocalUnionSupported")
 
 local function FireNotice(NoticeText, DetailText)
@@ -5189,29 +5196,254 @@ local function FireNotice(NoticeText, DetailText)
 	warn("[F3X] " .. NoticeText)
 end
 
-local function ProbeUnion()
-	local Ok = pcall(function()
+local ProbeEnv = (type(getgenv) == "function" and getgenv()) or _G
+
+local function GlobalFunction(...)
+	for _, Name in ipairs({ ... }) do
+		if type(ProbeEnv[Name]) == "function" then
+			return ProbeEnv[Name]
+		end
+		if type(rawget(_G, Name)) == "function" then
+			return rawget(_G, Name)
+		end
+	end
+	return nil
+end
+
+local SCAN_LIMIT = 4000
+local SCAN_BUDGET = 1
+
+local function IsUnionOperation(Object)
+	if Object == nil then
+		return false
+	end
+	local Ok, ClassName = pcall(function()
+		return Object.ClassName
+	end)
+	return Ok and ClassName == "UnionOperation"
+end
+
+-- Точки старта сканирования: сам DataModel плюс основные контейнеры.
+-- Если game:GetChildren() недоступен (бывает в урезанных окружениях), идём по сервисам.
+local function CollectRoots()
+	local Roots = { game }
+	for _, ServiceName in ipairs({ "Workspace", "Players", "ReplicatedStorage", "Lighting", "CoreGui", "StarterGui", "SoundService" }) do
+		local Ok, Service = pcall(function()
+			return game:GetService(ServiceName)
+		end)
+		if Ok and Service then
+			Roots[#Roots + 1] = Service
+		end
+	end
+	return Roots
+end
+
+-- Ищем юнион, не заходя в бесконечные ветки: обход в ширину, лимит и таймаут.
+local function FindUnionOperation()
+	local Visited, Deadline = 0, os.clock() + SCAN_BUDGET
+	local Queue, Head = CollectRoots(), 1
+
+	while Head <= #Queue and Visited < SCAN_LIMIT and os.clock() < Deadline do
+		local Current = Queue[Head]
+		Head += 1
+		Visited += 1
+
+		local Ok, Children = pcall(function()
+			return Current:GetChildren()
+		end)
+		if Ok and type(Children) == "table" then
+			for _, Child in ipairs(Children) do
+				if IsUnionOperation(Child) then
+					return Child, Visited
+				end
+				if #Queue < SCAN_LIMIT then
+					Queue[#Queue + 1] = Child
+				end
+			end
+		end
+	end
+
+	-- Удалённые из DataModel объекты живут в nil-инстансах.
+	local GetNil = GlobalFunction("getnilinstances", "get_nil_instances")
+	if GetNil then
+		local OkNil, Nils = pcall(GetNil)
+		if OkNil and type(Nils) == "table" then
+			for _, Object in ipairs(Nils) do
+				if IsUnionOperation(Object) then
+					return Object, Visited
+				end
+				local OkChild, Found = pcall(function()
+					return Object:FindFirstChildOfClass("UnionOperation", true)
+				end)
+				if OkChild and Found then
+					return Found, Visited
+				end
+			end
+		end
+	end
+
+	return nil, Visited
+end
+
+local function LooksLikeAssetId(Value)
+	if Value == nil then
+		return false
+	end
+	local Text = tostring(Value):lower()
+	if Text == "" or Text == "null" or Text == "nil" then
+		return false
+	end
+	if Text:find("null", 1, true) or Text:find("nil", 1, true) then
+		return false
+	end
+	return #Text > 5
+end
+
+local function CanReadUnionGeometry(Union)
+	local GetHidden = GlobalFunction("gethiddenproperty", "get_hidden_property", "get_hiddenprop")
+
+	local function TryGet(GetterName, PropertyName)
+		local Getter = GetHidden
+		if GetterName then
+			Getter = GlobalFunction(GetterName)
+		end
+		if not Getter then
+			return nil
+		end
+		local Ok, Value = pcall(Getter, Union, PropertyName)
+		if Ok and LooksLikeAssetId(Value) then
+			return tostring(Value)
+		end
+		return nil
+	end
+
+	for _, PropertyName in ipairs({ "AssetId", "MeshId", "PhysicalConfigData" }) do
+		local Value =
+			TryGet("gethiddenproperty", PropertyName)
+			or TryGet("get_hidden_property", PropertyName)
+			or TryGet("get_hiddenprop", PropertyName)
+			or TryGet(nil, PropertyName)
+		if Value then
+			return true, Value, PropertyName
+		end
+	end
+
+	-- Свойство может быть открыто напрямую (редко, но бывает).
+	local OkDirect, Direct = pcall(function()
+		return Union.AssetId
+	end)
+	if OkDirect and LooksLikeAssetId(Direct) then
+		return true, tostring(Direct), "AssetId"
+	end
+
+	return false, nil, nil
+end
+
+-- Крайний случай: в игре вообще нет юнионов. Пробуем создать тестовый.
+local function CanCreateUnion()
+	local Ok, Result = pcall(function()
 		local GeometryService = game:GetService("GeometryService")
 		local A = Instance.new("Part")
 		local B = Instance.new("Part")
 		A.Size, B.Size = Vector3.new(1, 1, 1), Vector3.new(1, 1, 1)
 		A.Anchored, B.Anchored = true, true
-		B.Position = A.Position + Vector3.new(0.5, 0, 0)
-		local Result = GeometryService:UnionAsync(A, { B })
-		local Worked = Result ~= nil
-		if Result then
-			Result:Destroy()
+		B.CFrame = A.CFrame * CFrame.new(0.5, 0, 0)
+		local Union = GeometryService:UnionAsync(A, { B })
+		local Worked = Union ~= nil
+		if Union then
+			pcall(function()
+				Union:Destroy()
+			end)
 		end
-		A:Destroy()
-		B:Destroy()
+		pcall(function()
+			A:Destroy()
+			B:Destroy()
+		end)
 		return Worked
 	end)
-	return Ok
+	return Ok and Result == true
 end
 
-if UnionSupported == nil then
-	UnionSupported = ProbeUnion()
+-- Возвращает таблицу с результатами: можно звать повторно для отладки.
+local function ProbeUnion()
+	local Info = {
+		Supported = false,
+		FoundUnion = false,
+		CanReadGeometry = false,
+		CanCreateUnion = false,
+		AssetId = nil,
+		Property = nil,
+		Scanned = 0,
+		Reason = nil,
+	}
+
+	local OkBody, Error = pcall(function()
+		local Union, Visited = FindUnionOperation()
+		Info.Scanned = Visited or 0
+		Info.FoundUnion = Union ~= nil
+
+		if Union then
+			local CanRead, AssetId, Property = CanReadUnionGeometry(Union)
+			Info.CanReadGeometry = CanRead
+			Info.AssetId = AssetId
+			Info.Property = Property
+		end
+
+		if not Info.CanReadGeometry then
+			Info.CanCreateUnion = CanCreateUnion()
+		end
+
+		Info.Supported = Info.CanReadGeometry or Info.CanCreateUnion
+
+		if Info.Supported then
+			Info.Reason = Info.CanReadGeometry
+				and ("executor can read union geometry (" .. tostring(Info.Property) .. " = " .. tostring(Info.AssetId) .. ")")
+				or "executor can create unions through GeometryService"
+		elseif Info.FoundUnion then
+			Info.Reason = "found a UnionOperation, but its geometry (AssetId) is locked and union creation failed"
+		else
+			Info.Reason = "no UnionOperation in the game and union creation failed"
+		end
+	end)
+
+	if not OkBody then
+		Info.Reason = "probe crashed: " .. tostring(Error)
+	end
+
+	return Info
+end
+
+local function UnionIsSupported()
+	local Global = rawget(_G, "Fork3XLocalUnionSupported")
+	if Global ~= nil then
+		return Global and true or false
+	end
+	return UnionSupported and true or false
+end
+
+local function RunProbe()
+	if rawget(_G, "Fork3XLocalUnionInfo") ~= nil then
+		return rawget(_G, "Fork3XLocalUnionInfo")
+	end
+
+	local Info = ProbeUnion()
+	UnionSupported = Info.Supported
 	rawset(_G, "Fork3XLocalUnionSupported", UnionSupported)
+	rawset(_G, "Fork3XLocalUnionInfo", Info)
+	if not Info.Supported then
+		rawset(_G, "Fork3XLocalUnionReason", Info.Reason)
+	end
+	return Info
+end
+
+rawset(_G, "Fork3XLocalProbeUnion", function()
+	rawset(_G, "Fork3XLocalUnionInfo", nil)
+	rawset(_G, "Fork3XLocalUnionSupported", nil)
+	return RunProbe()
+end)
+
+if UnionSupported == nil then
+	RunProbe()
 end
 
 local UnionActions = { "CreateUnion", "OldCreateUnion", "SeparateUnion", "ConvertUnion" }
@@ -5220,12 +5452,13 @@ for _, Name in ipairs(UnionActions) do
 	local Original = Actions[Name]
 	if Original then
 		Actions[Name] = function(...)
-			if not UnionSupported then
+			if not UnionIsSupported() then
+				local Info = rawget(_G, "Fork3XLocalUnionInfo")
 				FireNotice(
-					"Union недоступен в этом экзекьюторе",
-					"Геометрические операции (Union / Subtract / Separate) выполняются на сервере Roblox, "
-						.. "а у большинства экзекьюторов этот API закрыт.\n\n"
-						.. "Стройте из обычных деталей — остальные инструменты Fork3X работают полностью."
+					"Union is not available in this executor",
+					"Union / Subtract / Separate need CSG, which this executor cannot use.\n"
+						.. (Info and Info.Reason and ("Reason: " .. tostring(Info.Reason)) or "")
+						.. "\n\nBuild from regular parts - the rest of Fork3X works fine."
 				)
 				return nil
 			end
@@ -5233,7 +5466,8 @@ for _, Name in ipairs(UnionActions) do
 			if not Ok then
 				UnionSupported = false
 				rawset(_G, "Fork3XLocalUnionSupported", false)
-				FireNotice("Union недоступен в этом экзекьюторе", tostring(Result))
+				rawset(_G, "Fork3XLocalUnionReason", tostring(Result))
+				FireNotice("Union is not available in this executor", tostring(Result))
 				return nil
 			end
 			return Result
@@ -5241,9 +5475,7 @@ for _, Name in ipairs(UnionActions) do
 	end
 end
 
-if not UnionSupported then
-	print("[F3X] Union/CSG недоступен в этом экзекьюторе — кнопки Union отключены, остальное работает.")
-end
+-- Итог по Union печатает tail.lua (там же лежит строка «Ready»), чтобы не дублировать.
 
 -- Set up external connections
 SyncModule.Options.CustomSyncModuleConnections(SyncModule)
@@ -5464,7 +5696,7 @@ local Addon = {
 					if RunService:IsClient() and not RunService:IsStudio() then
 						return (function()
 	local Notice = rawget(_G, "Fork3XLocalNotify")
-	if Notice then pcall(Notice, 'Извлечение картинки из декали требует сервера — в локальной версии недоступно.', "") end
+	if Notice then pcall(Notice, 'Extracting an image from a decal needs the server — not available locally.', "") end
 	return nil
 end)();
 					end;
@@ -5549,7 +5781,7 @@ local Addon = {
 					if RunService:IsClient() and not RunService:IsStudio() then
 						return (function()
 	local Notice = rawget(_G, "Fork3XLocalNotify")
-	if Notice then pcall(Notice, 'Экспорт объектов (Export) требует сервера — в локальной версии недоступен.', "") end
+	if Notice then pcall(Notice, 'Export needs the game server — not available in the local build.', "") end
 	return nil
 end)();
 					end;
@@ -5846,7 +6078,7 @@ local Addon = {
 					if RunService:IsClient() and not RunService:IsStudio() then
 						return (function()
 	local Notice = rawget(_G, "Fork3XLocalNotify")
-	if Notice then pcall(Notice, 'Извлечение меша из ассета требует сервера — в локальной версии недоступно.', "") end
+	if Notice then pcall(Notice, 'Extracting a mesh from an asset needs the server — not available locally.', "") end
 	return nil
 end)();
 					end;
@@ -13656,7 +13888,13 @@ local PropScan = {}
 
 local ReflectionService = (function()
 	local Ok, Service = pcall(function() return game:GetService("ReflectionService") end)
-	return Ok and Service or nil
+	if Ok and Service then
+		return Service
+	end
+	-- [F3X-LOCAL] Заглушка: без ReflectionService свойств не видно, но код не падает.
+	-- Пустая таблица вместо nil: код проверяет результат через assert.
+	return { GetPropertiesOfClass = function() return {} end,
+		GetPropertyOfClass = function() return nil end }
 end)()
 
 local DefaultPropertiesList = {}
@@ -113718,7 +113956,7 @@ function Core.InitializeUI(DoNotCheckTheme)
 	if ThemeOk then
 		DoNotLookForProfile = ThemeResult or false
 	else
-		warn("[F3X] Не удалось применить тему: " .. tostring(ThemeResult))
+		warn("[F3X] Failed to apply theme: " .. tostring(ThemeResult))
 	end
 
 		if not DoNotLookForProfile then
@@ -113741,7 +113979,7 @@ function Core.InitializeUI(DoNotCheckTheme)
 	if ThemeOk then
 		DoNotLookForProfile = ThemeResult or false
 	else
-		warn("[F3X] Не удалось применить тему: " .. tostring(ThemeResult))
+		warn("[F3X] Failed to apply theme: " .. tostring(ThemeResult))
 	end
 
 		if not DoNotLookForProfile then
@@ -119059,9 +119297,26 @@ end
 
 --[[ Свойства StyleRule и атрибуты инстансов.
 
-Формат записи: {имя, код_типа, значения...}.
-Коды: 1 строка, 2 bool, 3 число, 4 UDim, 5 UDim2, 6 Color3, 7 Vector2,
-8 Vector3, 9 Font, 10 Enum (для атрибутов), 11 Rect. ]]
+Entry format: {name, type_code, values...}.
+
+Attribute codes:  1 string, 2 bool, 3 number, 4 UDim, 5 UDim2, 6 Color3,
+                  7 Vector2, 8 Vector3, 9 Font, 10 Enum.
+Style codes:      1 string, 2 bool, 3 number, 4 UDim, 5 UDim2, 6 Color3,
+                  7 Vector2, 8 Enum  <-- different from attributes! ]]
+
+local function enumItem(EnumTypeName, EnumValue)
+	local EnumType = Enum[EnumTypeName]
+	if not EnumType then
+		return nil
+	end
+	for _, Item in ipairs(EnumType:GetEnumItems()) do
+		if Item.Value == EnumValue then
+			return Item
+		end
+	end
+	return nil
+end
+
 local VALUE_BUILDERS = {
 	[1] = function(e) return e[3] end,
 	[2] = function(e) return e[3] end,
@@ -119071,7 +119326,7 @@ local VALUE_BUILDERS = {
 	[6] = function(e) return Color3.new(e[3], e[4], e[5]) end,
 	[7] = function(e) return Vector2.new(e[3], e[4]) end,
 	[8] = function(e) return Vector3.new(e[3], e[4], e[5]) end,
-	[9] = function(e)                 -- Font: семейство + начертание
+	[9] = function(e)                 -- Font: family + weight + style
 		local weight, style = nil, nil
 		pcall(function()
 			for _, item in ipairs(Enum.FontWeight:GetEnumItems()) do
@@ -119089,16 +119344,21 @@ local VALUE_BUILDERS = {
 		return ok and font or nil
 	end,
 	[10] = function(e)
-		local enumType = Enum[e[3]]
-		if not enumType then
-			return nil
-		end
-		for _, item in ipairs(enumType:GetEnumItems()) do
-			if item.Value == e[4] then
-				return item
-			end
-		end
-		return nil
+		return enumItem(e[3], e[4])
+	end,
+}
+
+-- В стилях код 8 — это Enum (в атрибутах 8 — Vector3), поэтому набор свой.
+local STYLE_BUILDERS = {
+	[1] = VALUE_BUILDERS[1],
+	[2] = VALUE_BUILDERS[2],
+	[3] = VALUE_BUILDERS[3],
+	[4] = VALUE_BUILDERS[4],
+	[5] = VALUE_BUILDERS[5],
+	[6] = VALUE_BUILDERS[6],
+	[7] = VALUE_BUILDERS[7],
+	[8] = function(e)
+		return enumItem(e[3], e[4])
 	end,
 }
 
@@ -119160,36 +119420,28 @@ local function sheetVariable(instance, name)
 	return nil
 end
 
+--[[ Значения стилей кладём в StyleRule «как есть»: движок Roblox сам разворачивает
+     ссылки на токены вида "$TextColor" (они живут атрибутами на StyleSheet токенов).
+     Важно только одно: тип варианта должен совпадать с типом свойства, иначе при
+     применении правила движок пишет "Variant cast failed". Раньше значения-перечисления
+     уходили как Vector3 (код 8 в стилях — это Enum, а не Vector3) — отсюда были сотни
+     ошибок про TextXAlignment, FillDirection, SortOrder и т.п. ]]
 local function applyStyle(instance, style)
 	for _, entry in ipairs(style) do
-		local build = VALUE_BUILDERS[entry[2]]
+		local build = STYLE_BUILDERS[entry[2]]
 		if build then
-			local ok = pcall(function()
-				local value = build(entry)
-				if value == nil then
-					return
-				end
-				instance:SetProperty(entry[1], value)
-				StylesApplied += 1
-			end)
-			if not ok then
-				-- значение-переменная ("$TextColor") — пробуем подставить значение из StyleSheet
-				local value = entry[3]
-				local resolved = nil
-				if type(value) == "string" and value:sub(1, 1) == "$" then
-					resolved = sheetVariable(instance, value:sub(2))
-				end
-				local ok2 = false
-				if resolved ~= nil then
-					ok2 = pcall(function()
-						instance:SetProperty(entry[1], resolved)
-					end)
-				end
-				if ok2 then
+			local Ok, Value = pcall(build, entry)
+			if Ok and Value ~= nil then
+				local SetOk = pcall(function()
+					instance:SetProperty(entry[1], Value)
+				end)
+				if SetOk then
 					StylesApplied += 1
 				else
 					StyleFailures += 1
 				end
+			else
+				StyleFailures += 1
 			end
 		end
 	end
@@ -119295,7 +119547,7 @@ end
 
 local Started = os.clock()
 
-print("[F3X] Fork3X 3.3.0 local · СБОРКА v6 · .Source не используется · атрибуты+темы на месте")
+print("[F3X] Fork3X 3.3.0 local · BUILD v6.2 · .Source is not used · themes + tags applied")
 
 --[[ Загрузка модулей без .Source.
 
@@ -119339,7 +119591,7 @@ local function LoadModule(Module)
 
 	local SourceText = SOURCES[Module]
 	if not SourceText then
-		error("require: нет исходника для " .. tostring(Module), 2)
+		error("require: no source for " .. tostring(Module), 2)
 	end
 
 	local Run
@@ -119364,7 +119616,7 @@ local function LoadModule(Module)
 		end
 		local FactoryResult = Factory()
 		if type(FactoryResult) ~= "function" then
-			error("require(" .. tostring(Module.Name) .. "): не удалось собрать модуль", 2)
+			error("require(" .. tostring(Module.Name) .. "): failed to build module", 2)
 		end
 		Run = function()
 			return FactoryResult(Module, LoadModule)
@@ -119374,7 +119626,7 @@ local function LoadModule(Module)
 	-- pcall, а не xpcall: модули F3X уходят в yield прямо в require.
 	local Ok, Result = pcall(Run)
 	if not Ok then
-		error("require(" .. tostring(Module.Name) .. ") упал: " .. tostring(Result), 2)
+		error("require(" .. tostring(Module.Name) .. ") failed: " .. tostring(Result), 2)
 	end
 
 	ModuleCache[Module], ModuleLoaded[Module] = Result, true
@@ -119414,7 +119666,7 @@ local SyncAPI = Tool:WaitForChild("SyncAPI")
 
 local function describeError(Err)
 	if Err == nil then
-		return "неизвестная ошибка (nil)"
+		return "unknown error (nil)"
 	end
 	if type(Err) == "table" then
 		Err = tostring(Err.Message or Err.message or Err)
@@ -119427,7 +119679,7 @@ end
 local SyncModuleOk, SyncModule = pcall(LoadModule, SyncAPI:WaitForChild("SyncModule"))
 
 if not SyncModuleOk then
-	warn("[F3X] SyncModule не загрузился (строительство не будет работать): " .. tostring(SyncModule))
+	warn("[F3X] SyncModule failed to load (building will not work): " .. tostring(SyncModule))
 	SyncModule = nil
 end
 
@@ -119440,7 +119692,7 @@ SyncAPI.OnInvoke = function(...)
 	local Result = table.pack(pcall(SyncModule.PerformAction, LocalPlayer,
 		table.unpack(Args, 1, Args.n)))
 	if not Result[1] then
-		warn("[F3X] Ошибка действия: " .. tostring(Result[2]))
+		warn("[F3X] Action error: " .. tostring(Result[2]))
 		return nil
 	end
 	return Result[2]
@@ -119511,7 +119763,7 @@ if not Headless then
 end
 
 if not Headless and not Ok then
-	warn("[F3X] Ошибка запуска ядра: " .. tostring(Result))
+	warn("[F3X] Core failed to start: " .. tostring(Result))
 elseif not Headless then
 	-- Уведомления инструмента: дублируем в консоль, чтобы было видно, что происходит.
 	pcall(function()
@@ -119524,24 +119776,32 @@ elseif not Headless then
 			end)
 		end
 		rawset(_G, "Fork3XLocalCore", Core)
+
 	end)
 
 	local Attrs, AttrFail, Tags, TagFail, Styles, StyleFail = getCounters()
 	print(string.format(
-		"[F3X] Готово за %.2f c: %d объектов, %d модулей, %d свойств, %d атрибутов, %d тегов, %d стилей (режим %s).",
+		"[F3X] Ready in %.2fs: %d objects, %d modules, %d properties, %d attributes, %d tags, %d styles (mode %s).",
 		os.clock() - Started, #Tool:GetDescendants(), ModulesLoaded, FailedProperties,
 		Attrs, Tags, Styles, LOAD_MODE
 	))
 	if AttrFail > 0 or TagFail > 0 or StyleFail > 0 then
 		print(string.format(
-			"[F3X] Не применилось: %d атрибутов, %d тегов, %d стилей (для остального дерево всё равно собрано).",
+			"[F3X] Not applied: %d attributes, %d tags, %d styles (the rest of the tree is still built).",
 			AttrFail, TagFail, StyleFail
 		))
 	end
-	print("[F3X] «" .. Tool.Name .. "» лежит в инвентаре — выберите его в хотбаре (1..9).")
-	print("[F3X] Горячие клавиши как в Fork3X: Z/X/C/V/B/N/M/K/J/H/G/F/U/P/L/T/Q/Y.")
+	print("[F3X] \"" .. Tool.Name .. "\" is in your Backpack — select it in the hotbar (1..9).")
+	print("[F3X] Hotkeys: Z/X/C/V/B/N/M/K/J/H/G/F/U/P/L/T/Q/Y (same as Fork3X).")
+	
+	local UnionInfo = rawget(_G, "Fork3XLocalUnionInfo")
 	if rawget(_G, "Fork3XLocalUnionSupported") == false then
-		print("[F3X] Union/CSG недоступен в этом экзекьюторе — кнопки Union отключены.")
+		print("[F3X] Union/CSG is not available in this executor — Union buttons are disabled.")
+		if UnionInfo and UnionInfo.Reason then
+			print("[F3X] Union check: " .. tostring(UnionInfo.Reason))
+		end
+	elseif UnionInfo then
+		print("[F3X] Union check passed: " .. tostring(UnionInfo.Reason or "geometry readable"))
 	end
 end
 
